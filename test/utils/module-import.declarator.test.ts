@@ -217,6 +217,136 @@ describe('Module Import Declarator', () => {
       );
     });
 
+    it.each([
+      'UsersService /* legacy */ as LegacyUsers',
+      'UsersService // legacy\n as LegacyUsers',
+      '/* UsersService */ AdminUsersService',
+    ])('should add a value import for %s', (specifier) => {
+      const imports =
+        "import { Module } from '@nestjs/common';\n" +
+        `import { ${specifier} } from './users/users.service';\n`;
+      expect(
+        new ModuleImportDeclarator().declare(imports + moduleBody, options),
+      ).toEqual(
+        imports +
+          "import { UsersService } from './users/users.service';\n" +
+          moduleBody,
+      );
+    });
+
+    it.each([
+      "import { UsersService as UsersService } from './users/users.service';",
+      "import DefaultService, { UsersService } from './users/users.service';",
+      "import /* keep */ { UsersService } /* keep */ from './users/users.service';",
+      "import { UsersService as LegacyUsers, UsersService } from './users/users.service';",
+    ])('should reuse an existing value binding: %s', (declaration) => {
+      const content = declaration + '\n' + moduleBody;
+      expect(new ModuleImportDeclarator().declare(content, options)).toEqual(
+        content,
+      );
+    });
+
+    it.each([
+      [
+        "import { type UsersService } from './users/users.service';",
+        "import { UsersService } from './users/users.service';",
+      ],
+      [
+        "import { type /* keep */ UsersService, type UserOptions } from './users/users.service';",
+        "import { /* keep */ UsersService, type UserOptions } from './users/users.service';",
+      ],
+      [
+        "import type { UsersService } from './users/users.service';",
+        "import { UsersService } from './users/users.service';",
+      ],
+      [
+        "import type /* keep */ { UsersService, UserOptions as Options } from './users/users.service';",
+        "import /* keep */ { UsersService, type UserOptions as Options } from './users/users.service';",
+      ],
+      [
+        "import type { UserOptions, UsersService as UsersService } from './users/users.service';",
+        "import { type UserOptions, UsersService as UsersService } from './users/users.service';",
+      ],
+      [
+        "import type { UsersService, UserOptions } from './users/users.service' with { /* mode note */ 'resolution-mode': 'require' };",
+        "import { UsersService, type UserOptions } from './users/users.service' /* mode note */;",
+      ],
+      [
+        "import type { UsersService } from './users/users.service' with { 'resolution-mode': 'import' };",
+        "import { UsersService } from './users/users.service';",
+      ],
+      [
+        "import type { UsersService } from './users/users.service' with { // mode note\n 'resolution-mode': 'require' };",
+        "import { UsersService } from './users/users.service' // mode note\n;",
+      ],
+    ])('should promote only the required type import: %s', (before, after) => {
+      const declarator = new ModuleImportDeclarator();
+      const output = declarator.declare(before + '\n' + moduleBody, options);
+      expect(output).toEqual(after + '\n' + moduleBody);
+      expect(declarator.declare(output, options)).toEqual(output);
+    });
+
+    it('should preserve a type-only alias when adding the value import', () => {
+      const imports =
+        "import type { UsersService as LegacyUsers } from './users/users.service';\n";
+      expect(
+        new ModuleImportDeclarator().declare(imports + moduleBody, options),
+      ).toEqual(
+        imports +
+          "import { UsersService } from './users/users.service';\n" +
+          moduleBody,
+      );
+    });
+
+    it.each([
+      "/*\nimport { UsersService } from './users/users.service';\n*/\n",
+      "const example = `\nimport { UsersService } from './users/users.service';\n`;\n",
+    ])('should ignore import text outside declarations: %s', (example) => {
+      const imports = "import { Module } from '@nestjs/common';\n";
+      expect(
+        new ModuleImportDeclarator().declare(
+          imports + example + moduleBody,
+          options,
+        ),
+      ).toEqual(
+        imports +
+          "import { UsersService } from './users/users.service';\n" +
+          example +
+          moduleBody,
+      );
+    });
+
+    it('should insert after a multiline import and its trailing comment', () => {
+      const imports =
+        "import { Module } from '@nestjs/common';\n" +
+        'import { UsersService /* keep */ as LegacyUsers }\n' +
+        "  from './users/users.service'; // keep this comment\n";
+      expect(
+        new ModuleImportDeclarator().declare(imports + moduleBody, options),
+      ).toEqual(
+        imports +
+          "import { UsersService } from './users/users.service';\n" +
+          moduleBody,
+      );
+    });
+
+    it.each([
+      "import { UsersService } from './legacy/users.service';",
+      "import { AdminUsersService as UsersService } from './users/users.service';",
+      "import UsersService from './users/users.service';",
+      "import * as UsersService from './users/users.service';",
+      "import UsersService = require('./legacy/users.service');",
+    ])('should report an existing conflicting import: %s', (declaration) => {
+      expect(() =>
+        new ModuleImportDeclarator().declare(
+          declaration + '\n' + moduleBody,
+          options,
+        ),
+      ).toThrow(
+        "Cannot import 'UsersService' from './users/users.service': the name is already bound by another import.",
+      );
+    });
+
     it('should still add the import for a similar symbol', () => {
       const content: string =
         "import { Module } from '@nestjs/common';\n" +

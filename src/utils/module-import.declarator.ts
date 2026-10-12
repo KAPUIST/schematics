@@ -1,4 +1,21 @@
 import { normalize, Path } from '@angular-devkit/core';
+import {
+  createScanner,
+  createSourceFile,
+  getTrailingCommentRanges,
+  ImportDeclaration,
+  ImportSpecifier,
+  isImportDeclaration,
+  isImportEqualsDeclaration,
+  isNamedImports,
+  isNamespaceImport,
+  isStringLiteral,
+  LanguageVariant,
+  Node,
+  ScriptTarget,
+  SourceFile,
+  SyntaxKind,
+} from 'typescript';
 import { DeclarationOptions } from './module.declarator.js';
 import { PathSolver } from './path.solver.js';
 
@@ -18,54 +35,150 @@ export class ModuleImportDeclarator {
    * @returns The updated content string with the import statement inserted.
    */
   public declare(content: string, options: DeclarationOptions): string {
-    if (this.isAlreadyImported(content, options)) {
-      return content;
-    }
-    const toInsert = this.buildLineToInsert(options);
-    const contentLines = content.split('\n');
-    const finalImportIndex = this.findImportsEndpoint(contentLines);
-    contentLines.splice(finalImportIndex + 1, 0, toInsert);
-    return contentLines.join('\n');
-  }
-
-  /**
-   * Checks whether the content already imports the symbol without an alias
-   * from the same path.
-   *
-   * @param content - The content of the file where the import will be declared.
-   * @param options - The options for the declaration, including the symbol and path.
-   * @returns `true` if the import statement is already present.
-   */
-  private isAlreadyImported(
-    content: string,
-    options: DeclarationOptions,
-  ): boolean {
-    const escape = (value: string) =>
-      value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const symbol = escape(String(options.symbol));
-    const path = escape(this.computeRelativePath(options));
-    return new RegExp(
-      `^\\s*import\\s*\\{[^}]*(?<![\\w$])${symbol}(?![\\w$])(?!\\s+as\\b)[^}]*\\}` +
-        `\\s*from\\s*['"]${path}['"]`,
-      'm',
-    ).test(content);
-  }
-
-  /**
-   * Finds the endpoint of the existing import statements in the content.
-   *
-   * @param contentLines - The lines of the content.
-   * @returns The index of the last import statement.
-   */
-  private findImportsEndpoint(contentLines: string[]): number {
-    const reversedContent = Array.from(contentLines).reverse();
-    const reverseImports = reversedContent.filter((line) =>
-      line.match(/\} from ('|")/),
+    const source = createSourceFile(
+      options.module,
+      content,
+      ScriptTarget.Latest,
+      true,
     );
-    if (reverseImports.length <= 0) {
-      return 0;
+    const imports = source.statements.filter(isImportDeclaration);
+    const symbol = String(options.symbol);
+    const path = this.computeRelativePath(options);
+    const conflictMessage = `Cannot import '${symbol}' from '${path}': the name is already bound by another import.`;
+
+    if (
+      source.statements.some(
+        (statement) =>
+          isImportEqualsDeclaration(statement) &&
+          statement.name.text === symbol,
+      )
+    ) {
+      throw new Error(conflictMessage);
     }
-    return contentLines.indexOf(reverseImports[0]);
+
+    for (const declaration of imports) {
+      const clause = declaration.importClause;
+      if (!clause) continue;
+
+      const bindings = clause.namedBindings;
+      const specifier =
+        bindings && isNamedImports(bindings)
+          ? bindings.elements.find((element) => element.name.text === symbol)
+          : undefined;
+      if (
+        specifier &&
+        (specifier.propertyName ?? specifier.name).text === symbol &&
+        isStringLiteral(declaration.moduleSpecifier) &&
+        declaration.moduleSpecifier.text === path
+      ) {
+        return this.promoteTypeImport(content, source, declaration, specifier);
+      }
+
+      if (
+        specifier ||
+        clause.name?.text === symbol ||
+        (bindings &&
+          isNamespaceImport(bindings) &&
+          bindings.name.text === symbol)
+      ) {
+        throw new Error(conflictMessage);
+      }
+    }
+
+    const toInsert = this.buildLineToInsert(options);
+    const newline = content.includes('\r\n') ? '\r\n' : '\n';
+    const lastImport = imports.at(-1);
+    if (lastImport) {
+      const comments = getTrailingCommentRanges(content, lastImport.end);
+      const position = comments?.at(-1)?.end ?? lastImport.end;
+      return (
+        content.slice(0, position) +
+        newline +
+        toInsert +
+        content.slice(position)
+      );
+    }
+
+    const position = source.statements[0]?.getStart(source) ?? content.length;
+    const prefix = content.slice(0, position);
+    return (
+      prefix +
+      (prefix && !prefix.endsWith('\n') ? newline : '') +
+      toInsert +
+      newline +
+      content.slice(position)
+    );
+  }
+
+  /**
+   * Makes the existing binding available at runtime, preserving comments and
+   * keeping the other specifiers in a type-only declaration type-only.
+   */
+  private promoteTypeImport(
+    content: string,
+    source: SourceFile,
+    declaration: ImportDeclaration,
+    specifier: ImportSpecifier,
+  ): string {
+    const clause = declaration.importClause!;
+    const edits: { start: number; end: number; text: string }[] = [];
+    const removeTypeKeyword = (node: Node) => {
+      const token = node.getFirstToken(source)!;
+      const end = token.end + (/[ \t]/.test(content[token.end] ?? '') ? 1 : 0);
+      edits.push({ start: token.getStart(source), end, text: '' });
+    };
+
+    if (clause.isTypeOnly) {
+      removeTypeKeyword(clause);
+      const attributes = declaration.attributes;
+      if (
+        attributes?.elements.length === 1 &&
+        attributes.elements[0].name.text === 'resolution-mode'
+      ) {
+        // This attribute is only legal on type-only declarations. The matched
+        // relative service path resolves to the same file in either mode.
+        let start = attributes.getStart(source);
+        const scanner = createScanner(
+          ScriptTarget.Latest,
+          false,
+          LanguageVariant.Standard,
+          content.slice(start, attributes.end),
+        );
+        const comments: string[] = [];
+        const newline = content.includes('\r\n') ? '\r\n' : '\n';
+        for (
+          let token = scanner.scan();
+          token !== SyntaxKind.EndOfFileToken;
+          token = scanner.scan()
+        ) {
+          if (token === SyntaxKind.MultiLineCommentTrivia) {
+            comments.push(scanner.getTokenText());
+          } else if (token === SyntaxKind.SingleLineCommentTrivia) {
+            comments.push(scanner.getTokenText() + newline);
+          }
+        }
+        const text = comments.join(' ');
+        if (!text && /[ \t]/.test(content[start - 1] ?? '')) start--;
+        edits.push({ start, end: attributes.end, text });
+      }
+      const bindings = clause.namedBindings;
+      if (bindings && isNamedImports(bindings)) {
+        for (const other of bindings.elements) {
+          if (other !== specifier && !other.isTypeOnly) {
+            const start = other.getStart(source);
+            edits.push({ start, end: start, text: 'type ' });
+          }
+        }
+      }
+    }
+    if (specifier.isTypeOnly) {
+      removeTypeKeyword(specifier);
+    }
+    for (const edit of edits.sort((a, b) => b.start - a.start)) {
+      content =
+        content.slice(0, edit.start) + edit.text + content.slice(edit.end);
+    }
+    return content;
   }
 
   /**
